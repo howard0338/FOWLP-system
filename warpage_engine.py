@@ -729,8 +729,12 @@ def plot_process_timeline(
     import plotly.graph_objects as go
 
     x = list(range(len(snapshots)))
-    y = [s.warpage_edge_mm for s in snapshots]
-    labels = [s.label for s in snapshots]
+    y = [float(s.warpage_edge_mm) for s in snapshots]
+    labels = [str(s.label) for s in snapshots]
+    hover_text = [
+        f"{s.label} ({s.shape_label})<br>T={float(s.temperature_c):.0f}°C<br>w={float(s.warpage_edge_mm):.3f} mm"
+        for s in snapshots
+    ]
     marker_colors = [
         "#c62828" if i == selected_idx else ("#ef5350" if v > 0 else "#1e88e5" if v < 0 else "#9e9e9e")
         for i, v in enumerate(y)
@@ -746,9 +750,8 @@ def plot_process_timeline(
             name="Warpage",
             line=dict(color="#546e7a", width=2),
             marker=dict(size=sizes, color=marker_colors, line=dict(width=1, color="#37474f")),
-            customdata=[[lb, sh] for lb, sh in zip(labels, [s.shape_label for s in snapshots])],
-            hovertemplate="%{customdata[0]} (%{customdata[1]})<br>T=%{text}°C<br>w=%{y:.3f} mm<extra></extra>",
-            text=[s.temperature_c for s in snapshots],
+            text=hover_text,
+            hovertemplate="%{text}<extra></extra>",
         )
     )
     fig.add_hline(y=0, line_width=1, line_color="#424242", opacity=0.6)
