@@ -10,6 +10,7 @@ from composite_layer import (
     DEFAULT_DIE_AREA_FRACTION,
     DIE_KEY,
     EMC_KEY,
+    MOLDING_COMPOSITE_KEY,
     arch_has_molding_pair,
     rule_of_mixtures,
 )
@@ -35,9 +36,6 @@ _MATERIAL_CSS_DEFAULT = "fowlp-mat--default"
 def _mat_class(material_key: str) -> str:
     return _LAYER_STYLES.get(material_key, (material_key, "?", _MATERIAL_CSS_DEFAULT))[2]
 
-# Minimum band chrome (px) — prevents label overlap
-_BAND_META_PX = 58
-_BAND_GAP_PX = 8
 _STACK_BAR_PX = 200
 
 
@@ -96,8 +94,8 @@ def _composite_band(cfg: MaterialInputConfig, active_map: dict[str, bool]) -> di
 
 
 def _molding_zone_visible(active_map: dict[str, bool]) -> bool:
-    """Show EMC+Die coplanar band only when at least one is in this process step."""
-    return bool(active_map.get(DIE_KEY, False) or active_map.get(EMC_KEY, False))
+    """Coplanar molding UI only when BOTH EMC and Die are active (matches solver collapse)."""
+    return bool(active_map.get(DIE_KEY, False) and active_map.get(EMC_KEY, False))
 
 
 def _bands_bottom_to_top(
@@ -144,11 +142,88 @@ def _visual_bands_top_first(
     return list(reversed(_bands_bottom_to_top(cfg, layer_active=layer_active)))
 
 
-def _band_heights_px(bands: list[dict[str, Any]]) -> list[int]:
-    total_t = sum(b["t_um"] for b in bands) or 1.0
-    raw = [max(40, int(_STACK_BAR_PX * b["t_um"] / total_t)) for b in bands]
-    scale = sum(raw) / _STACK_BAR_PX
-    return [max(40, int(h / scale)) for h in raw]
+def _band_is_active(band: dict[str, Any]) -> bool:
+    if band["kind"] == "composite":
+        return bool(band.get("die_active") or band.get("emc_active"))
+    return bool(band.get("active"))
+
+
+def _segment_from_layer_stack(
+    ls,
+    cfg: MaterialInputConfig,
+    active_map: dict[str, bool],
+) -> dict[str, Any]:
+    """One plate segment from solver LayerStack (bottom→top order)."""
+    key = ls.material_key
+    if key == MOLDING_COMPOSITE_KEY:
+        band = _composite_band(cfg, active_map)
+        band = {**band, "t_um": float(ls.thickness_um), "active": True}
+        return band
+    title, tag, mat_cls = _LAYER_STYLES.get(key, (key, key[:3].upper(), _MATERIAL_CSS_DEFAULT))
+    return {
+        "kind": "layer",
+        "key": key,
+        "title": title,
+        "tag": tag,
+        "mat_cls": mat_cls,
+        "t_um": float(ls.thickness_um),
+        "e_gpa": float(cfg.E_gpa.get(key, 0.0)),
+        "active": True,
+    }
+
+
+def _solver_plate_segments_bottom_to_top(
+    cfg: MaterialInputConfig,
+    step: ProcessStep,
+    active_map: dict[str, bool],
+) -> list[dict[str, Any]]:
+    """Plate geometry = exact layers in warpage solver (single source of truth)."""
+    stacks, _ = build_stack_for_step(
+        step,
+        packaging_architecture=cfg.packaging_architecture,
+        substrate_thickness_um=cfg.thickness_um.get("Silicon Substrate"),
+        layer_thickness_um=cfg.thickness_um,
+        layer_active=active_map,
+    )
+    return [_segment_from_layer_stack(ls, cfg, active_map) for ls in stacks if ls.include]
+
+
+def _segment_heights_px(segments_bottom_to_top: list[dict[str, Any]]) -> list[int]:
+    """Partition _STACK_BAR_PX by physical thickness (no inter-band DOM gaps)."""
+    total_t = sum(b["t_um"] for b in segments_bottom_to_top) or 1.0
+    raw = [max(2, int(_STACK_BAR_PX * b["t_um"] / total_t)) for b in segments_bottom_to_top]
+    drift = _STACK_BAR_PX - sum(raw)
+    if drift and raw:
+        raw[-1] = max(2, raw[-1] + drift)
+    return raw
+
+
+def _na_bottom_percent(z_na_um: float, total_t_um: float) -> float:
+    """CSS bottom % for z_NA line (0 = stack bottom, 100 = stack top)."""
+    if total_t_um <= 0:
+        return 0.0
+    ratio = max(0.0, min(1.0, float(z_na_um) / float(total_t_um)))
+    return ratio * 100.0
+
+
+def _na_marker_bottom_px(
+    z_na_um: float,
+    segments_bottom_to_top: list[dict[str, Any]],
+    seg_heights_px: list[int],
+) -> float:
+    """Pixel offset from plate bottom (matches segment rounding, sub-layer accurate)."""
+    total_t = sum(s["t_um"] for s in segments_bottom_to_top) or 1.0
+    z = max(0.0, min(float(z_na_um), total_t))
+    cum_t = 0.0
+    cum_px = 0.0
+    for seg, h_px in zip(segments_bottom_to_top, seg_heights_px):
+        t_um = float(seg["t_um"])
+        if z <= cum_t + t_um + 1e-9:
+            frac = (z - cum_t) / t_um if t_um > 0 else 0.0
+            return cum_px + frac * float(h_px)
+        cum_t += t_um
+        cum_px += float(h_px)
+    return max(0.0, min(cum_px, float(_STACK_BAR_PX)))
 
 
 def _html_pill(
@@ -168,59 +243,55 @@ def _html_pill(
     )
 
 
-def _html_band_layer(band: dict[str, Any], bar_px: int) -> str:
+def _html_plate_segment_layer(band: dict[str, Any], seg_px: int) -> str:
     active = band["active"]
-    band_cls = "fowlp-band fowlp-band--on" if active else "fowlp-band fowlp-band--off"
     bar_state = "fowlp-mat-bar--active" if active else "fowlp-mat-bar--inactive"
     mat_cls = band.get("mat_cls", _MATERIAL_CSS_DEFAULT)
-    status = "" if active else '<div class="fowlp-status">not in this step</div>'
-
-    return f"""
-<article class="{band_cls}" style="min-height:{bar_px + _BAND_META_PX}px">
-  <div class="fowlp-band-bar-wrap">
-    <div class="fowlp-band-bar fowlp-mat-bar {mat_cls} {bar_state}" style="height:{bar_px}px">
-      <span class="fowlp-band-tag">{html.escape(band['tag'])}</span>
-    </div>
-  </div>
-  <div class="fowlp-band-info">
-    <div class="fowlp-band-title">{html.escape(band['title'])}</div>
-    <div class="fowlp-band-meta">t = {band['t_um']:.0f} µm · E = {band['e_gpa']:.1f} GPa</div>
-    {status}
-  </div>
-</article>
-"""
+    return (
+        f'<div class="fowlp-plate-segment" style="height:{seg_px}px" '
+        f'title="{html.escape(band["title"])}">'
+        f'<div class="fowlp-mat-bar fowlp-plate-bar {mat_cls} {bar_state}">'
+        f'<span class="fowlp-band-tag">{html.escape(band["tag"])}</span>'
+        f"</div></div>"
+    )
 
 
-def _html_band_composite(band: dict[str, Any], bar_px: int) -> str:
+def _html_plate_segment_composite(band: dict[str, Any], seg_px: int) -> str:
     f = float(band["die_frac"])
     die_pct = f * 100.0
     emc_pct = 100.0 - die_pct
     any_on = band["die_active"] or band["emc_active"]
-    band_cls = "fowlp-band fowlp-band--on" if any_on else "fowlp-band fowlp-band--off"
     row_cls = "fowlp-composite-row fowlp-composite-row--on" if any_on else "fowlp-composite-row fowlp-composite-row--off"
-
-    die_pill = _html_pill(
-        "DIE", active=band["die_active"], mat_cls=band["die_mat"], flex_pct=die_pct
+    die_pill = _html_pill("DIE", active=band["die_active"], mat_cls=band["die_mat"], flex_pct=die_pct)
+    emc_pill = _html_pill("EMC", active=band["emc_active"], mat_cls=band["emc_mat"], flex_pct=emc_pct)
+    return (
+        f'<div class="fowlp-plate-segment fowlp-plate-segment--composite" style="height:{seg_px}px">'
+        f'<div class="{row_cls} fowlp-plate-bar">{die_pill}'
+        f'<div class="fowlp-coplanar-divider" aria-hidden="true"></div>{emc_pill}</div></div>'
     )
-    emc_pill = _html_pill(
-        "EMC", active=band["emc_active"], mat_cls=band["emc_mat"], flex_pct=emc_pct
-    )
 
+
+def _html_legend_row(band: dict[str, Any]) -> str:
+    if band["kind"] == "composite":
+        active = band["die_active"] or band["emc_active"]
+        band_cls = "fowlp-legend fowlp-legend--on" if active else "fowlp-legend fowlp-legend--off"
+        die_pct = float(band["die_frac"]) * 100.0
+        meta = (
+            f"t = {band['t_um']:.0f} µm (EMC envelope) · Die {die_pct:.0f}% · "
+            f"E_eff = {band['e_gpa']:.1f} GPa"
+        )
+        extra = f'<div class="fowlp-coplanar-note">{html.escape(COPLANAR_NOTE)}</div>'
+    else:
+        active = band["active"]
+        band_cls = "fowlp-legend fowlp-legend--on" if active else "fowlp-legend fowlp-legend--off"
+        meta = f"t = {band['t_um']:.0f} µm · E = {band['e_gpa']:.1f} GPa"
+        extra = "" if active else '<div class="fowlp-status">not in this step</div>'
     return f"""
-<article class="{band_cls} fowlp-band--composite" style="min-height:{bar_px + _BAND_META_PX + 22}px">
-  <div class="fowlp-band-bar-wrap">
-    <div class="{row_cls}" style="height:{bar_px}px">
-      {die_pill}
-      <div class="fowlp-coplanar-divider" aria-hidden="true"></div>
-      {emc_pill}
-    </div>
-  </div>
-  <div class="fowlp-band-info">
-    <div class="fowlp-band-title">{html.escape(band['title'])}</div>
-    <div class="fowlp-coplanar-note">{html.escape(COPLANAR_NOTE)}</div>
-    <div class="fowlp-band-meta">t = {band['t_um']:.0f} µm (EMC envelope) · Die {die_pct:.0f}% · E_eff = {band['e_gpa']:.1f} GPa</div>
-  </div>
-</article>
+<div class="{band_cls}">
+  <div class="fowlp-legend-title">{html.escape(band['title'])}</div>
+  {extra}
+  <div class="fowlp-band-meta">{meta}</div>
+</div>
 """
 
 
@@ -287,61 +358,100 @@ def _stack_visual_css() -> str:
   text-transform: uppercase;
 }
 .fowlp-stack-body {
-  position: relative;
   padding: 8px 16px 12px;
-  overflow: hidden;
   background: linear-gradient(180deg, rgba(248,250,252,0.4) 0%, rgba(241,245,249,0.2) 100%);
 }
-.fowlp-stack-column {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
+.fowlp-stack-layout {
+  display: grid;
+  grid-template-columns: minmax(108px, 34%) 1fr;
+  gap: 14px;
+  align-items: stretch;
 }
 
-/* --- Band cards --- */
-.fowlp-band {
-  display: grid;
-  grid-template-columns: minmax(120px, 38%) 1fr;
-  gap: 14px;
-  padding: 10px 12px;
+/* Continuous physical plate (no gaps between layers) */
+.fowlp-stack-plate {
+  position: relative;
+  width: 100%;
+  height: 200px;
+  display: flex;
+  flex-direction: column-reverse;
+  gap: 0;
   border-radius: 10px;
   overflow: hidden;
+  box-shadow: 0 4px 14px rgba(15, 23, 42, 0.12), inset 0 1px 0 rgba(255, 255, 255, 0.35);
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  background: rgba(241, 245, 249, 0.5);
+}
+.fowlp-plate-segment {
+  flex: 0 0 auto;
+  width: 100%;
+  min-height: 2px;
   box-sizing: border-box;
-  transition: box-shadow 0.2s ease, transform 0.2s ease;
 }
-.fowlp-band--on {
-  background: rgba(255, 255, 255, 0.78);
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
-  border: 1px solid rgba(255, 255, 255, 0.45);
-  box-shadow: 0 4px 10px rgba(0, 0, 0, 0.08);
+.fowlp-plate-segment--composite .fowlp-composite-row {
+  height: 100%;
+  min-height: 100%;
 }
-.fowlp-band--off {
-  background: rgba(248, 250, 252, 0.35);
+.fowlp-plate-bar,
+.fowlp-mat-bar.fowlp-plate-bar {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-height: 100%;
+  border-radius: 0;
+  display: flex;
+  align-items: center;
+  overflow: hidden;
+  box-sizing: border-box;
+}
+.fowlp-stack-legends {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-around;
+  gap: 6px;
+  min-height: 200px;
+}
+.fowlp-legend {
+  padding: 8px 10px;
+  border-radius: 8px;
+  box-sizing: border-box;
+}
+.fowlp-legend--on {
+  background: rgba(255, 255, 255, 0.72);
+  border: 1px solid rgba(255, 255, 255, 0.5);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.05);
+}
+.fowlp-legend--off {
+  background: rgba(248, 250, 252, 0.4);
   border: 1px dashed rgba(148, 163, 184, 0.45);
-  box-shadow: none;
-  opacity: 0.72;
+  opacity: 0.75;
 }
-.fowlp-band-bar-wrap { display: flex; align-items: stretch; min-width: 0; }
+.fowlp-legend-title {
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.3;
+  color: #0F172A;
+}
 
 /* Material bars — gradients @ 135deg */
 .fowlp-mat-bar {
   position: relative;
   width: 100%;
-  border-radius: 10px;
   display: flex;
   align-items: center;
   overflow: hidden;
   box-sizing: border-box;
 }
 .fowlp-mat-bar--active {
-  border: 1px solid rgba(255, 255, 255, 0.3);
-  box-shadow: 0 4px 10px rgba(0, 0, 0, 0.08), inset 0 1px 0 rgba(255, 255, 255, 0.35);
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.35);
+  opacity: 0.92;
 }
 .fowlp-mat-bar--inactive {
-  background: rgba(226, 232, 240, 0.35) !important;
+  background: rgba(226, 232, 240, 0.45) !important;
   border: 1px dashed rgba(148, 163, 184, 0.55) !important;
   box-shadow: none !important;
+  opacity: 0.55;
 }
 .fowlp-mat--sub {
   background: linear-gradient(135deg, #1E3A8A 0%, #2563EB 55%, #3B82F6 100%);
@@ -437,26 +547,6 @@ def _stack_visual_css() -> str:
   box-shadow: 0 0 6px rgba(239, 68, 68, 0.35);
 }
 
-/* Info column */
-.fowlp-band-info {
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  gap: 4px;
-  min-height: 58px;
-  overflow: hidden;
-  min-width: 0;
-}
-.fowlp-band-title {
-  font-size: 13px;
-  font-weight: 600;
-  line-height: 1.3;
-  color: #0F172A;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.fowlp-band--off .fowlp-band-title { color: #94A3B8; }
 .fowlp-band-meta {
   font-size: 11px;
   color: #64748B;
@@ -476,37 +566,41 @@ def _stack_visual_css() -> str:
   margin-top: 2px;
 }
 
-/* z_NA — glow + badge */
+/* z_NA — absolute overlay on continuous plate (physics z from bottom) */
 .fowlp-zna {
   position: absolute;
-  left: 16px;
-  right: 16px;
+  left: 0;
+  right: 0;
   pointer-events: none;
-  z-index: 4;
+  z-index: 10;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
+  padding: 0 4px;
+  transform: translateY(1px);
 }
 .fowlp-zna-line {
   flex: 1;
   height: 0;
   border: none;
   border-top: 2px dashed #EF4444;
-  box-shadow: 0 0 8px rgba(239, 68, 68, 0.55), 0 0 16px rgba(239, 68, 68, 0.22);
-  filter: drop-shadow(0 0 2px rgba(239, 68, 68, 0.4));
+  box-shadow: 0 0 10px rgba(239, 68, 68, 0.65), 0 0 18px rgba(239, 68, 68, 0.28);
+  filter: drop-shadow(0 0 3px rgba(239, 68, 68, 0.55));
 }
 .fowlp-zna-label {
   flex: 0 0 auto;
-  font-size: 11px;
+  font-size: 10px;
   font-weight: 800;
-  letter-spacing: 0.06em;
-  color: #991B1B;
+  letter-spacing: 0.05em;
+  color: #FEF2F2;
   text-transform: uppercase;
-  padding: 4px 12px;
-  border-radius: 8px;
-  background: linear-gradient(135deg, rgba(254, 226, 226, 0.98) 0%, rgba(252, 165, 165, 0.95) 100%);
-  border: 1px solid rgba(239, 68, 68, 0.45);
-  box-shadow: 0 0 14px rgba(239, 68, 68, 0.35), 0 2px 8px rgba(0, 0, 0, 0.08);
+  padding: 3px 8px;
+  border-radius: 6px;
+  background: rgba(185, 28, 28, 0.88);
+  border: 1px solid rgba(254, 202, 202, 0.9);
+  box-shadow: 0 0 12px rgba(239, 68, 68, 0.45), 0 2px 6px rgba(0, 0, 0, 0.25);
+  text-shadow: 0 0 6px rgba(0, 0, 0, 0.85), 0 1px 2px rgba(0, 0, 0, 0.9),
+    0 0 2px #FFFFFF;
 }
 .fowlp-stack-footer {
   padding: 12px 20px 16px;
@@ -534,25 +628,28 @@ def build_stack_schematic_html(
     if not bands:
         return "<p style='color:#64748B;font-family:system-ui'>No layer data</p>"
 
-    bar_heights = _band_heights_px(bands)
-    total_t = _plate_thickness_um(cfg, step, active_map)
-    stack_body_px = sum(bar_heights) + len(bands) * (_BAND_META_PX + _BAND_GAP_PX)
+    plate_segments = _solver_plate_segments_bottom_to_top(cfg, step, active_map)
+    seg_heights = _segment_heights_px(plate_segments)
+    total_t = sum(s["t_um"] for s in plate_segments) or _plate_thickness_um(cfg, step, active_map)
 
-    parts: list[str] = []
-    for band, bar_px in zip(bands, bar_heights):
+    plate_parts: list[str] = []
+    for band, seg_px in zip(plate_segments, seg_heights):
         if band["kind"] == "composite":
-            parts.append(_html_band_composite(band, bar_px))
+            plate_parts.append(_html_plate_segment_composite(band, seg_px))
         else:
-            parts.append(_html_band_layer(band, bar_px))
+            plate_parts.append(_html_plate_segment_layer(band, seg_px))
+
+    legend_parts = [_html_legend_row(b) for b in bands]
 
     z_marker = ""
-    if z_na_um is not None and total_t > 0:
-        z_ratio = max(0.0, min(1.0, z_na_um / total_t))
-        z_bottom_pct = (1.0 - z_ratio) * 100.0
+    if z_na_um is not None and total_t > 0 and plate_segments:
+        na_bottom_px = _na_marker_bottom_px(z_na_um, plate_segments, seg_heights)
+        na_bottom_pct = _na_bottom_percent(z_na_um, total_t)
         z_marker = (
-            f'<div class="fowlp-zna" style="bottom:{z_bottom_pct:.2f}%" '
-            f'title="Neutral axis from stack bottom">'
-            f'<span class="fowlp-zna-line"></span>'
+            f'<div class="fowlp-zna" style="bottom:{na_bottom_px:.2f}px;" '
+            f'title="z_NA = {z_na_um:.1f} µm / Σt = {total_t:.1f} µm '
+            f'({na_bottom_pct:.1f}% from stack bottom)">'
+            f'<span class="fowlp-zna-line" aria-hidden="true"></span>'
             f'<span class="fowlp-zna-label">z_NA · {z_na_um:.1f} µm</span></div>'
         )
 
@@ -590,11 +687,16 @@ def build_stack_schematic_html(
     {z_badge}
   </div>
 </div>
-<div class="fowlp-stack-axis"><span>↑ TOP</span><span>↓ BOTTOM</span></div>
-<div class="fowlp-stack-body" style="min-height:{stack_body_px + 12}px">
-  {z_marker}
-  <div class="fowlp-stack-column">
-    {''.join(parts)}
+<div class="fowlp-stack-axis"><span>↑ TOP</span><span>↓ BOTTOM (z=0)</span></div>
+<div class="fowlp-stack-body">
+  <div class="fowlp-stack-layout">
+    <div class="fowlp-stack-plate" style="height:{_STACK_BAR_PX}px">
+      {z_marker}
+      {''.join(plate_parts)}
+    </div>
+    <div class="fowlp-stack-legends">
+      {''.join(legend_parts)}
+    </div>
   </div>
 </div>
 <div class="fowlp-stack-footer">
@@ -612,10 +714,9 @@ def schematic_height_px(
     layer_active: dict[str, bool] | None = None,
 ) -> int:
     bands = _visual_bands_top_first(cfg, step, layer_active=layer_active)
-    bar_heights = _band_heights_px(bands)
-    body = sum(bar_heights) + len(bands) * (_BAND_META_PX + _BAND_GAP_PX)
-    extra = 22 if any(b["kind"] == "composite" for b in bands) else 0
-    return int(120 + body + extra + 36)
+    legend_rows = max(len(bands), 1)
+    body_h = max(_STACK_BAR_PX, legend_rows * 52)
+    return int(118 + body_h + 40)
 
 
 def _layer_rows(

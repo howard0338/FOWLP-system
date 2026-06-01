@@ -457,6 +457,13 @@ def run_design_window_sweep(
     }
 
 
+def _signed_warpage_contour_limits(z_signed: np.ndarray) -> tuple[float, float]:
+    """Symmetric z limits about 0 so colormap midpoint = flat (w ≈ 0)."""
+    max_abs = float(np.max(np.abs(z_signed))) if z_signed.size else 0.0
+    max_abs = max(max_abs, 0.05)
+    return -max_abs, max_abs
+
+
 def plot_design_window_contour(
     sweep: dict[str, Any],
     *,
@@ -467,6 +474,7 @@ def plot_design_window_contour(
     s1: OptParamSpec = sweep["param1"]
     s2: OptParamSpec = sweep["param2"]
     z_signed = sweep["z_signed"]
+    zmin_c, zmax_c = _signed_warpage_contour_limits(z_signed)
     z_abs = sweep["z_abs"]
     safe_mask = sweep["safe_mask"]
     w_lo = sweep["w_safe_min"]
@@ -504,7 +512,10 @@ def plot_design_window_contour(
             x=sweep["x_vals"],
             y=sweep["y_vals"],
             z=z_signed,
-            colorscale="RdYlBu_r",
+            colorscale="RdBu",
+            zmid=0,
+            zmin=zmin_c,
+            zmax=zmax_c,
             colorbar=dict(title="Warpage w (mm)"),
             contours=dict(coloring="heatmap", showlabels=False),
             hovertext=hover,
