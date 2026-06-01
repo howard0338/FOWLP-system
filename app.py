@@ -24,7 +24,7 @@ import streamlit as st
 
 
 
-from constants import WARPAGE_CRITICAL_MM
+from constants import WARPAGE_CRITICAL_MM, WARPAGE_CRITICAL_UM, WARPAGE_UNIT, mm_to_um
 
 from design_window import (
 
@@ -434,7 +434,7 @@ def render_simulator_tab(mat_in: MaterialInputConfig) -> None:
 
         st.markdown(
 
-            '<div class="critical-banner">⚠ Critical Fail: |warpage| > 1.5 mm</div>',
+            f'<div class="critical-banner">⚠ Critical Fail: |warpage| > {WARPAGE_CRITICAL_UM:.0f} {WARPAGE_UNIT}</div>',
 
             unsafe_allow_html=True,
 
@@ -449,9 +449,13 @@ def render_simulator_tab(mat_in: MaterialInputConfig) -> None:
 
     c1, c2, c3, c4 = st.columns(4)
 
-    c1.metric("Warpage @ edge", f"{w_char:.3f} mm")
+    c1.metric("Warpage @ edge", f"{mm_to_um(w_char):.1f} {WARPAGE_UNIT}")
 
-    c2.metric("Warpage @ center", f"{snap.warpage_center_mm:.3f} mm", help="Center-referenced: always 0")
+    c2.metric(
+        "Warpage @ center",
+        f"{mm_to_um(snap.warpage_center_mm):.1f} {WARPAGE_UNIT}",
+        help="Center-referenced: always 0",
+    )
 
     c3.metric("Shape", snap.shape_label)
 

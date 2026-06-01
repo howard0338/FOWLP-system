@@ -173,8 +173,23 @@ PROCESS_T_REF_C = 25.0
 DEFAULT_MEASUREMENT_T_C = 25.0  # measurement / room-temperature warpage assessment (°C)
 DEFAULT_EVALUATION_T_C = DEFAULT_MEASUREMENT_T_C  # legacy alias
 DEFAULT_STRESS_FREE_T_C = 175.0  # molding cure / stress-free temperature (°C)
-WAFER_RADIUS_MM = 150.0  # 300 mm wafer
-WARPAGE_CRITICAL_MM = 1.5
+WAFER_RADIUS_MM = 150.0  # 300 mm wafer (solver internal, mm)
+WARPAGE_CRITICAL_MM = 1.5  # solver / compare threshold (mm)
+
+# UI length & warpage display (micrometers)
+UM_PER_MM = 1000.0
+WARPAGE_UNIT = "µm"
+
+
+def mm_to_um(x_mm: float) -> float:
+    return float(x_mm) * UM_PER_MM
+
+
+def um_to_mm(x_um: float) -> float:
+    return float(x_um) / UM_PER_MM
+
+
+WARPAGE_CRITICAL_UM = mm_to_um(WARPAGE_CRITICAL_MM)
 
 @dataclass(frozen=True)
 class LayerInputSpec:

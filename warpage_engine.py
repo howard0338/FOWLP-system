@@ -26,8 +26,11 @@ from constants import (
     STRESS_FREE_RELAXATION,
     WARPAGE_CALIBRATION,
     ProcessStep,
+    UM_PER_MM,
     WAFER_RADIUS_MM,
     WARPAGE_CRITICAL_MM,
+    WARPAGE_CRITICAL_UM,
+    WARPAGE_UNIT,
     build_stack_for_step,
 )
 from composite_layer import (
@@ -333,7 +336,7 @@ def calculate_warpage(
 
     - t: µm → m, E: GPa → Pa, α: ppm/°C → 1/K, r: mm → m
     - M [N/m] = Σ σᵢ hᵢ zᵢ (zᵢ from z_NA); D [N·m] = E_ref h³ / (12(1−ν²))
-    - κ [1/m] = M / D; w [m] = κ r² / 2; UI displays w in mm
+    - κ [1/m] = M / D; w [m] = κ r² / 2; UI displays w in µm
     """
     active = [ls for ls in layer_stacks if ls.include]
     if not active:
@@ -724,10 +727,9 @@ def warpage_profile_radial(
 
 
 def warpage_display_unit(peak_mm: float) -> tuple[float, str]:
-    """Pick mm or µm so slider-driven changes are visible on charts."""
-    if peak_mm < 0.05:
-        return 1e3, "µm"
-    return 1.0, "mm"
+    """Scale internal mm warpage to micrometers for all charts."""
+    _ = peak_mm
+    return UM_PER_MM, WARPAGE_UNIT
 
 
 def padded_axis_range(
@@ -901,6 +903,8 @@ def plot_radial_warpage(
     scale, unit = warpage_display_unit(peak_mm)
     w_plot = w_mm * scale
     crit_plot = critical_mm * scale
+    crit_um = critical_mm * UM_PER_MM
+    peak_um = peak_mm * UM_PER_MM
 
     fig = go.Figure()
     fig.add_trace(
@@ -913,7 +917,7 @@ def plot_radial_warpage(
         )
     )
 
-    # Do not pin Y axis to 1.5 mm fail line when warpage is orders of magnitude smaller
+    # Do not pin Y axis to critical fail line when warpage is orders of magnitude smaller
     y_range = padded_axis_range(w_plot, floor=0.0, min_span=max(peak_mm * scale * 0.1, 1e-6))
     y_range[0] = 0.0
     if crit_plot <= y_range[1] * 1.25:
@@ -921,7 +925,7 @@ def plot_radial_warpage(
             y=crit_plot,
             line_dash="dash",
             line_color="red",
-            annotation_text=f"Critical {critical_mm:.2f} mm",
+            annotation_text=f"Critical {crit_um:.0f} {unit}",
         )
         y_range[1] = max(y_range[1], crit_plot * 1.05)
     else:
@@ -934,7 +938,7 @@ def plot_radial_warpage(
             yanchor="top",
             showarrow=False,
             font=dict(color="red", size=11),
-            text=f"Fail limit {critical_mm:.2f} mm (off scale; peak ≈ {peak_mm:.4f} mm)",
+            text=f"Fail limit {crit_um:.0f} {unit} (off scale; peak ≈ {peak_um:.1f} {unit})",
         )
 
     fig.update_layout(
@@ -958,7 +962,7 @@ def plot_process_timeline(
     import plotly.graph_objects as go
 
     x = list(range(len(snapshots)))
-    y = [float(s.warpage_edge_mm) for s in snapshots]
+    y = [float(s.warpage_edge_mm) * UM_PER_MM for s in snapshots]
     labels = [str(s.label) for s in snapshots]
     hover_text = [
         (
@@ -966,7 +970,7 @@ def plot_process_timeline(
             f"Process T={float(s.temperature_c):.0f}°C<br>"
             f"T_sf={float(s.T_stress_free_c):.0f}°C<br>"
             f"ΔT={float(s.delta_T_c):.0f}°C<br>"
-            f"w={float(s.warpage_edge_mm):.4f} mm"
+            f"w={float(s.warpage_edge_mm) * UM_PER_MM:.1f} {WARPAGE_UNIT}"
         )
         for s in snapshots
     ]
@@ -993,28 +997,27 @@ def plot_process_timeline(
 
     y_arr = np.asarray(y, dtype=float)
     ymax_data = float(np.max(np.abs(y_arr))) if y_arr.size else 0.0
-    # Scale Y axis to data so sub-mm process variation is visible (do not force ±1.5 mm view)
-    ymax = max(ymax_data * 1.25, 0.008, 1e-6)
+    ymax = max(ymax_data * 1.25, WARPAGE_CRITICAL_UM * 0.01, 1e-6)
     y_range = [-ymax, ymax]
 
-    if WARPAGE_CRITICAL_MM <= ymax * 2.5:
+    if WARPAGE_CRITICAL_UM <= ymax * 2.5:
         fig.add_hline(
-            y=WARPAGE_CRITICAL_MM,
+            y=WARPAGE_CRITICAL_UM,
             line_dash="dash",
             line_color="#e53935",
             line_width=2,
-            annotation_text=f"Fail +{WARPAGE_CRITICAL_MM} mm",
+            annotation_text=f"Fail +{WARPAGE_CRITICAL_UM:.0f} {WARPAGE_UNIT}",
             annotation_position="right",
         )
         fig.add_hline(
-            y=-WARPAGE_CRITICAL_MM,
+            y=-WARPAGE_CRITICAL_UM,
             line_dash="dash",
             line_color="#e53935",
             line_width=2,
-            annotation_text=f"Fail −{WARPAGE_CRITICAL_MM} mm",
+            annotation_text=f"Fail −{WARPAGE_CRITICAL_UM:.0f} {WARPAGE_UNIT}",
             annotation_position="right",
         )
-        y_range[1] = max(y_range[1], WARPAGE_CRITICAL_MM * 1.05)
+        y_range[1] = max(y_range[1], WARPAGE_CRITICAL_UM * 1.05)
         y_range[0] = -y_range[1]
     else:
         fig.add_annotation(
@@ -1026,7 +1029,10 @@ def plot_process_timeline(
             yanchor="top",
             showarrow=False,
             font=dict(color="#e53935", size=10),
-            text=f"Spec ±{WARPAGE_CRITICAL_MM:.1f} mm (off scale; peak |w| ≈ {ymax_data:.4f} mm)",
+            text=(
+                f"Spec ±{WARPAGE_CRITICAL_UM:.0f} {WARPAGE_UNIT} "
+                f"(off scale; peak |w| ≈ {ymax_data:.1f} {WARPAGE_UNIT})"
+            ),
         )
     title = "Process warpage timeline (center-referenced, signed)"
     if architecture_label:
@@ -1034,7 +1040,7 @@ def plot_process_timeline(
     fig.update_layout(
         title=dict(text=title, x=0.02, xanchor="left"),
         xaxis=dict(tickmode="array", tickvals=x, ticktext=labels),
-        yaxis_title="Warpage @ edge (mm)",
+        yaxis_title=f"Warpage @ edge ({WARPAGE_UNIT})",
         yaxis=dict(range=y_range, autorange=False, zeroline=True),
         height=380,
         margin=dict(b=110),

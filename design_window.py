@@ -8,7 +8,7 @@ from typing import Any, Literal
 
 import numpy as np
 
-from constants import INPUT_LAYER_SPECS
+from constants import INPUT_LAYER_SPECS, UM_PER_MM, WARPAGE_UNIT, mm_to_um
 from packaging_arch import final_timeline_label, timeline_labels_for_architecture
 from layer_inputs import MaterialInputConfig
 from packaging_arch import DW_DEFAULT_PARAMS, PackagingArchitecture, parse_architecture, visible_material_keys
@@ -457,10 +457,10 @@ def run_design_window_sweep(
     }
 
 
-def _signed_warpage_contour_limits(z_signed: np.ndarray) -> tuple[float, float]:
-    """Symmetric z limits about 0 so colormap midpoint = flat (w ≈ 0)."""
-    max_abs = float(np.max(np.abs(z_signed))) if z_signed.size else 0.0
-    max_abs = max(max_abs, 0.05)
+def _signed_warpage_contour_limits(z_um: np.ndarray) -> tuple[float, float]:
+    """Symmetric z limits about 0 so colormap midpoint = flat (w ≈ 0), in µm."""
+    max_abs = float(np.max(np.abs(z_um))) if z_um.size else 0.0
+    max_abs = max(max_abs, 50.0)
     return -max_abs, max_abs
 
 
@@ -474,11 +474,14 @@ def plot_design_window_contour(
     s1: OptParamSpec = sweep["param1"]
     s2: OptParamSpec = sweep["param2"]
     z_signed = sweep["z_signed"]
-    zmin_c, zmax_c = _signed_warpage_contour_limits(z_signed)
-    z_abs = sweep["z_abs"]
+    z_um = z_signed * UM_PER_MM
+    z_abs_um = sweep["z_abs"] * UM_PER_MM
+    zmin_c, zmax_c = _signed_warpage_contour_limits(z_um)
     safe_mask = sweep["safe_mask"]
     w_lo = sweep["w_safe_min"]
     w_hi = sweep["w_safe_max"]
+    w_lo_um = mm_to_um(w_lo)
+    w_hi_um = mm_to_um(w_hi)
 
     hover = np.empty(z_signed.shape, dtype=object)
     for j in range(z_signed.shape[0]):
@@ -487,7 +490,8 @@ def plot_design_window_contour(
             hover[j, i] = (
                 f"{s1.label}={sweep['x_vals'][i]:.3g}<br>"
                 f"{s2.label}={sweep['y_vals'][j]:.3g}<br>"
-                f"Warpage w={z_signed[j,i]:.3f} mm<br>|w|={z_abs[j,i]:.3f} mm<br>{status}"
+                f"Warpage w={z_um[j,i]:.1f} {WARPAGE_UNIT}<br>"
+                f"|w|={z_abs_um[j,i]:.1f} {WARPAGE_UNIT}<br>{status}"
             )
 
     fig = go.Figure()
@@ -503,7 +507,7 @@ def plot_design_window_contour(
                 colorscale=[[0, "rgba(255,255,255,0)"], [1, "rgba(46,125,50,0.35)"]],
                 showscale=False,
                 hoverinfo="skip",
-                name=f"Safe window [{w_lo}, {w_hi}] mm",
+                name=f"Safe window [{w_lo_um:+.0f}, {w_hi_um:+.0f}] {WARPAGE_UNIT}",
             )
         )
 
@@ -511,12 +515,12 @@ def plot_design_window_contour(
         go.Contour(
             x=sweep["x_vals"],
             y=sweep["y_vals"],
-            z=z_signed,
+            z=z_um,
             colorscale="RdBu",
             zmid=0,
             zmin=zmin_c,
             zmax=zmax_c,
-            colorbar=dict(title="Warpage w (mm)"),
+            colorbar=dict(title=f"Warpage w ({WARPAGE_UNIT})"),
             contours=dict(coloring="heatmap", showlabels=False),
             hovertext=hover,
             hovertemplate="%{hovertext}<extra></extra>",
@@ -524,26 +528,26 @@ def plot_design_window_contour(
         )
     )
 
-    for level, color, dash in (
-        (w_hi, "#2E7D32", "solid"),
-        (w_lo, "#2E7D32", "solid"),
+    for level_um, color, dash in (
+        (w_hi_um, "#2E7D32", "solid"),
+        (w_lo_um, "#2E7D32", "solid"),
     ):
         fig.add_trace(
             go.Contour(
                 x=sweep["x_vals"],
                 y=sweep["y_vals"],
-                z=z_signed,
+                z=z_um,
                 contours=dict(
                     coloring="none",
                     showlabels=True,
                     labelfont=dict(size=10, color=color),
                     type="constraint",
                     operation="=",
-                    value=level,
+                    value=level_um,
                 ),
                 line=dict(color=color, width=2, dash=dash),
                 showscale=False,
-                name=f"w = {level:+.1f} mm",
+                name=f"w = {level_um:+.0f} {WARPAGE_UNIT}",
                 hoverinfo="skip",
             )
         )
@@ -565,7 +569,8 @@ def plot_design_window_contour(
             name="Optimal (Min Warpage)",
             hovertemplate=(
                 f"<b>最佳解</b><br>{s1.label}=%{{x:.4g}}<br>{s2.label}=%{{y:.4g}}"
-                f"<br>w={sweep['opt_w_signed']:.3f} mm<br>|w|={sweep['opt_w_abs']:.3f} mm<extra></extra>"
+                f"<br>w={mm_to_um(sweep['opt_w_signed']):.1f} {WARPAGE_UNIT}"
+                f"<br>|w|={mm_to_um(sweep['opt_w_abs']):.1f} {WARPAGE_UNIT}<extra></extra>"
             ),
         )
     )
@@ -573,7 +578,7 @@ def plot_design_window_contour(
     step_label = sweep.get("eval_label", "Final")
     title_html = (
         "2D Parameter Optimization &amp; Process Window"
-        f"<br><sup>Eval: {step_label} · Green = {w_lo:+.1f} to {w_hi:+.1f} mm · ★ Min |warpage|</sup>"
+        f"<br><sup>Eval: {step_label} · Green = {w_lo_um:+.0f} to {w_hi_um:+.0f} {WARPAGE_UNIT} · ★ Min |warpage|</sup>"
     )
     fig.update_layout(
         title=dict(text=title_html, x=0.02, xanchor="left"),
@@ -599,8 +604,8 @@ def render_design_window_page(
     st.caption(
         "2D Parameter Optimization & Process Window · "
         f"架構：**{base_cfg.packaging_architecture}** · "
-        f"Grid Search → 最終步驟翹曲 · 安全區間 {PROCESS_WINDOW_W_MIN_MM:+.1f} ~ "
-        f"{PROCESS_WINDOW_W_MAX_MM:+.1f} mm"
+        f"Grid Search → 最終步驟翹曲 · 安全區間 {mm_to_um(PROCESS_WINDOW_W_MIN_MM):+.0f} ~ "
+        f"{mm_to_um(PROCESS_WINDOW_W_MAX_MM):+.0f} {WARPAGE_UNIT}"
     )
 
     catalog = build_opt_param_catalog(base_cfg)
@@ -738,7 +743,7 @@ def render_design_window_page(
             "翹曲指標",
             options=["signed_debond", "abs_debond", "abs_max_process"],
             format_func=lambda m: {
-                "signed_debond": "Signed warpage（製程視窗 ±1 mm）",
+                "signed_debond": f"Signed warpage（製程視窗 ±{mm_to_um(PROCESS_WINDOW_W_MAX_MM):.0f} {WARPAGE_UNIT}）",
                 "abs_debond": "|warpage| 最小化",
                 "abs_max_process": "全製程 max |warpage|",
             }[m],
@@ -779,8 +784,8 @@ def render_design_window_page(
 
     st.markdown("##### ④ 最佳解 (Optimal Solution)")
     m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Min |warpage|", f"{sweep['opt_w_abs']:.3f} mm")
-    m2.metric("w @ optimum (signed)", f"{sweep['opt_w_signed']:+.3f} mm")
+    m1.metric("Min |warpage|", f"{mm_to_um(sweep['opt_w_abs']):.1f} {WARPAGE_UNIT}")
+    m2.metric("w @ optimum (signed)", f"{mm_to_um(sweep['opt_w_signed']):+.1f} {WARPAGE_UNIT}")
     m3.metric(s1.label.split("—")[0].strip(), f"{sweep['opt_x']:.4g}")
     m4.metric(s2.label.split("—")[0].strip(), f"{sweep['opt_y']:.4g}")
     m5.metric("安全區占比", f"{100 * sweep['safe_fraction']:.1f} %")

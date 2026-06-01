@@ -1,6 +1,6 @@
 # Advanced Packaging Warpage Simulator
 
-Advanced packaging warpage simulator (multi-layer plate theory + Streamlit UI). Includes a **2D Optimization & Process Window** tab: grid search (custom Min/Max, 20×20), ±1 mm safe zone contour, and optimal ★ marker.
+Advanced packaging warpage simulator (multi-layer plate theory + Streamlit UI). Includes a **2D Optimization & Process Window** tab: grid search (custom Min/Max, 20×20), ±1000 µm safe zone contour, and optimal ★ marker.
 
 **Author · Shih-Ho Lin**
 
