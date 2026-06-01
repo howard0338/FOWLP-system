@@ -1,4 +1,4 @@
-"""FOWLP warpage engine: modified multi-layer plate theory with thermo-elastic stress."""
+"""2.5D advanced packaging warpage engine: multi-layer plate theory with thermo-elastic stress."""
 
 from __future__ import annotations
 
@@ -8,11 +8,14 @@ import numpy as np
 
 from constants import (
     DEBOND_RELEASE_RATIO,
+    E_MIN_SOLDER_GPA,
+    E_REF_PA_FLOOR,
     EMC_E_MIN_FRACTION,
     EMC_MOMENT_FACTOR_WITH_INTERPOSER,
     EMC_T_SOFTEN_END_C,
     EMC_T_SOFTEN_START_C,
     INTERPOSER_MOMENT_GAIN,
+    SOLDER_MOMENT_FACTOR,
     LayerStack,
     LayerType,
     MaterialProps,
@@ -26,6 +29,23 @@ from constants import (
     WAFER_RADIUS_MM,
     WARPAGE_CRITICAL_MM,
     build_stack_for_step,
+)
+from composite_layer import (
+    MOLDING_COMPOSITE_KEY,
+    composite_alpha_ppm,
+    composite_e_gpa,
+)
+from packaging_arch import (
+    FOWLP_COMPLIANT_LAYER_TYPES,
+    INTERPOSER_NA_STIFFNESS_WEIGHT,
+    PackagingArchitecture,
+    parse_architecture,
+    CURING_STATION_LABELS,
+    process_temperature_for_step,
+    thermal_delta_for_timeline_step,
+    timeline_layer_active,
+    timeline_step_by_label,
+    timeline_steps_for_architecture,
 )
 
 
@@ -57,22 +77,65 @@ class WarpageResult:
 
 @dataclass
 class ProcessStepSnapshot:
-    """One FOWLP process step after sequential (residual-stress) analysis."""
+    """One packaging process step after sequential (residual-stress) analysis."""
 
     step: ProcessStep
     label: str
     temperature_c: float
     T_stress_free_c: float
+    delta_T_c: float
     result: WarpageResult
     warpage_edge_mm: float  # signed @ edge, center-referenced: w(R) = κR²/2
     warpage_center_mm: float  # always 0 (center reference)
     shape_label: str  # Bow / Crown / Flat
 
 
+# --- SI unit helpers (inputs → SI, outputs → display) ---
+def um_to_m(t_um: float) -> float:
+    return float(t_um) * 1e-6
+
+
+def gpa_to_pa(E_gpa: float) -> float:
+    return float(E_gpa) * 1e9
+
+
+def ppm_to_per_k(alpha_ppm: float) -> float:
+    return float(alpha_ppm) * 1e-6
+
+
+def mm_to_m(r_mm: float) -> float:
+    return float(r_mm) * 1e-3
+
+
+def m_to_mm(w_m: float) -> float:
+    return float(w_m) * 1e3
+
+
+def warpage_at_radius_m(kappa_1_per_m: float, r_mm: float) -> float:
+    """Center-referenced displacement w [m]: w = κ r² / 2, r converted from mm to m."""
+    r_m = mm_to_m(r_mm)
+    return 0.5 * float(kappa_1_per_m) * r_m**2
+
+
+def warpage_at_radius_mm(kappa_1_per_m: float, r_mm: float) -> float:
+    """Display helper: w [mm] from κ [1/m] and r [mm]."""
+    return m_to_mm(warpage_at_radius_m(kappa_1_per_m, r_mm))
+
+
+def kappa_from_edge_warpage_m(w_edge_m: float, r_mm: float) -> float:
+    """Recover κ [1/m] from edge displacement w(R) [m] (center-referenced)."""
+    r_m = mm_to_m(r_mm)
+    return 2.0 * float(w_edge_m) / max(r_m**2, 1e-18)
+
+
+def kappa_from_edge_warpage_mm(w_edge_mm: float, r_mm: float) -> float:
+    """Recover κ [1/m] from edge displacement w(R) [mm]."""
+    return kappa_from_edge_warpage_m(mm_to_m(w_edge_mm), r_mm)
+
+
 def displacement_mm(kappa_1_per_m: float, r_mm: float) -> float:
-    """Center-referenced signed warpage (mm): w(r) = κ r² / 2, w(0) = 0."""
-    r_m = r_mm * 1e-3
-    return 0.5 * kappa_1_per_m * r_m**2 * 1e3
+    """Alias: signed warpage w(r) in mm."""
+    return warpage_at_radius_mm(kappa_1_per_m, r_mm)
 
 
 def warpage_shape_label(kappa: float) -> str:
@@ -87,10 +150,6 @@ def _diverging_z_limits(z_mm: np.ndarray) -> tuple[float, float]:
     zmax = float(np.max(np.abs(finite))) if finite.size else 1e-6
     zmax = max(zmax, 1e-9)
     return -zmax, zmax
-
-
-def alpha_ppm_to_per_k(ppm: float) -> float:
-    return ppm * 1e-6
 
 
 def effective_alpha(
@@ -136,29 +195,102 @@ def effective_young_modulus(
     E = E_override_gpa if E_override_gpa is not None else material.E_gpa
     if material.layer_type.value == "emc":
         return effective_emc_modulus(E, T_c)
+    if material.layer_type == LayerType.SOLDER:
+        return max(float(E), E_MIN_SOLDER_GPA)
     return E
 
 
 def find_neutral_axis(
     layers: list[tuple[MaterialProps, float, float]],
+    *,
+    stiffness_weight: float = 1.0,
 ) -> float:
     """
     Neutral axis from centroid of axial stiffness (EA).
-    layers: (material, thickness_m, E_eff_gpa)
+    layers: (material, thickness_m, E_eff_Pa)
     Returns z_na from bottom surface (m).
     """
     z = 0.0
     sum_ea = 0.0
     sum_eaz = 0.0
-    for mat, h, E in layers:
-        z_mid = z + h / 2.0
-        ea = E * h
+    for mat, h_m, E_pa in layers:
+        z_mid = z + h_m / 2.0
+        ea = E_pa * h_m * stiffness_weight
         sum_ea += ea
         sum_eaz += ea * z_mid
-        z += h
+        z += h_m
     if sum_ea < 1e-30:
         return 0.0
     return sum_eaz / sum_ea
+
+
+def flexural_rigidity_pa_m3(E_pa: float, h_m: float, nu: float) -> float:
+    """D = E h³ / (12 (1 − ν²))  [N·m] (per unit width in multi-layer effective sense)."""
+    return E_pa * h_m**3 / (12.0 * max(1.0 - nu**2, 1e-9))
+
+
+def find_neutral_axis_for_architecture(
+    layers: list[tuple[MaterialProps, float, float, str]],
+    packaging_architecture: str,
+) -> float:
+    """
+    Architecture-specific z_NA:
+    - FOWLP: only active compliant/metal layers (EMC, RDL, Carrier).
+    - CoWoS-S: full active stack with high stiffness weight on Si interposer.
+    """
+    arch = parse_architecture(packaging_architecture)
+    if arch == PackagingArchitecture.FOWLP_INFO:
+        compliant = [
+            (mat, h_m, E_pa)
+            for mat, h_m, E_pa, _key in layers
+            if mat.layer_type.value in FOWLP_COMPLIANT_LAYER_TYPES
+        ]
+        if compliant:
+            return find_neutral_axis(compliant)
+        return find_neutral_axis([(m, h_m, E_pa) for m, h_m, E_pa, _ in layers])
+
+    z = 0.0
+    sum_ea = 0.0
+    sum_eaz = 0.0
+    for mat, h_m, E_pa, _key in layers:
+        z_mid = z + h_m / 2.0
+        weight = 0.0 if mat.layer_type == LayerType.SOLDER else (
+            INTERPOSER_NA_STIFFNESS_WEIGHT
+            if mat.layer_type == LayerType.INTERPOSER
+            else 1.0
+        )
+        ea = E_pa * h_m * weight
+        sum_ea += ea
+        sum_eaz += ea * z_mid
+        z += h_m
+    if sum_ea < 1e-30:
+        return 0.0
+    return sum_eaz / sum_ea
+
+
+def reference_alpha_sub_ppm(
+    props: list[tuple[MaterialProps, float, float, float, float, str]],
+    packaging_architecture: str,
+    *,
+    default_ppm: float = 2.6,
+) -> float:
+    """CTE reference layer for Δα · ΔT (architecture-dependent)."""
+    arch = parse_architecture(packaging_architecture)
+    if arch == PackagingArchitecture.FOWLP_INFO:
+        for mat, _h, _e, alpha, _z, _key in props:
+            if mat.layer_type == LayerType.CARRIER:
+                return alpha * 1e6
+        for mat, _h, _e, alpha, _z, _key in props:
+            if mat.layer_type == LayerType.EMC:
+                return alpha * 1e6
+        return 5.0
+    for mat, _h, _e, alpha, _z, _key in props:
+        if mat.layer_type == LayerType.INTERPOSER:
+            return alpha * 1e6
+    for mat, _h, _e, alpha, _z, _key in props:
+        if mat.layer_type == LayerType.SILICON:
+            return alpha * 1e6
+    return default_ppm
 
 
 def layer_thermal_stress_pa(
@@ -176,6 +308,13 @@ def calculate_warpage(
     layer_stacks: list[LayerStack],
     T_c: float,
     T_ref_c: float = 25.0,
+    *,
+    measurement_T_c: float | None = None,
+    evaluation_T_c: float | None = None,  # legacy alias
+    stress_free_T_c: float | None = None,
+    delta_t_mode: str = "process",
+    thermal_delta_T_c: float | None = None,
+    die_area_fraction: float = 0.30,
     wafer_radius_mm: float = WAFER_RADIUS_MM,
     carrier_constrained: bool = False,
     alpha_sub_ppm: float = 2.6,
@@ -187,14 +326,14 @@ def calculate_warpage(
     emc_E_gpa: float | None = None,
     layer_E_gpa: dict[str, float] | None = None,
     moment_multiplier: float = 1.0,
+    packaging_architecture: str = PackagingArchitecture.FOWLP_INFO.value,
 ) -> WarpageResult:
     """
-    Modified multi-layer Stoney extension:
+    Multi-layer plate warpage (strict SI internally):
 
-    w(r) = 0.5 * kappa * r^2
-    kappa = (1-nu)/(E*h^2) * sum_i(6 * sigma_i * h_i * z_i)
-
-    z_i: distance from neutral axis to layer centroid.
+    - t: µm → m, E: GPa → Pa, α: ppm/°C → 1/K, r: mm → m
+    - M [N/m] = Σ σᵢ hᵢ zᵢ (zᵢ from z_NA); D [N·m] = E_ref h³ / (12(1−ν²))
+    - κ [1/m] = M / D; w [m] = κ r² / 2; UI displays w in mm
     """
     active = [ls for ls in layer_stacks if ls.include]
     if not active:
@@ -211,65 +350,104 @@ def calculate_warpage(
             theta_grid=np.zeros((64, 64)),
         )
 
-    alpha_sub = alpha_ppm_to_per_k(alpha_sub_ppm)
-    delta_T = T_c - T_ref_c
+    T_sf_c = stress_free_T_c if stress_free_T_c is not None else T_ref_c
+    T_meas = measurement_T_c if measurement_T_c is not None else evaluation_T_c
+    if thermal_delta_T_c is not None:
+        T_props_c = T_c
+        delta_T = thermal_delta_T_c
+    elif delta_t_mode == "measurement" and T_meas is not None:
+        T_props_c = T_meas
+        delta_T = T_meas - T_sf_c
+    else:
+        T_props_c = T_c
+        delta_T = T_c - T_sf_c
 
     # Build effective properties per layer
-    props: list[tuple[MaterialProps, float, float, float, float]] = []
+    props: list[tuple[MaterialProps, float, float, float, float, str]] = []
     z_bottom = 0.0
     for ls in active:
         mat = ls.material
-        h_m = ls.thickness_um * 1e-6
-        E_override = None
-        if layer_E_gpa and ls.material_key in layer_E_gpa:
-            E_override = layer_E_gpa[ls.material_key]
-        elif mat.layer_type.value == "emc" and emc_E_gpa is not None:
-            E_override = emc_E_gpa
-        E_gpa = effective_young_modulus(mat, T_c, E_override_gpa=E_override)
-
-        if mat.layer_type.value == "emc":
-            a_ppm = effective_alpha(mat, T_c, emc_alpha1, emc_alpha2, None)
-        elif mat.layer_type.value == "rdl":
-            a_ppm = effective_alpha(mat, T_c, rdl_alpha1, rdl_alpha2, rdl_Tg)
+        h_m = um_to_m(ls.thickness_um)
+        if ls.material_key == MOLDING_COMPOSITE_KEY:
+            E_gpa = composite_e_gpa(
+                T_props_c,
+                die_area_fraction,
+                layer_E_gpa=layer_E_gpa,
+                emc_E_gpa=emc_E_gpa,
+                effective_young_modulus=effective_young_modulus,
+            )
+            a_ppm = composite_alpha_ppm(
+                T_props_c,
+                die_area_fraction,
+                emc_alpha1=emc_alpha1,
+                emc_alpha2=emc_alpha2,
+                effective_alpha=effective_alpha,
+            )
         else:
-            a_ppm = effective_alpha(mat, T_c)
+            E_override = None
+            if layer_E_gpa and ls.material_key in layer_E_gpa:
+                E_override = layer_E_gpa[ls.material_key]
+            elif mat.layer_type.value == "emc" and emc_E_gpa is not None:
+                E_override = emc_E_gpa
+            E_gpa = effective_young_modulus(mat, T_props_c, E_override_gpa=E_override)
 
-        alpha = alpha_ppm_to_per_k(a_ppm)
-        props.append((mat, h_m, E_gpa * 1e9, alpha, z_bottom + h_m / 2.0))
+            if mat.layer_type.value == "emc":
+                a_ppm = effective_alpha(mat, T_props_c, emc_alpha1, emc_alpha2, None)
+            elif mat.layer_type.value == "rdl":
+                a_ppm = effective_alpha(mat, T_props_c, rdl_alpha1, rdl_alpha2, rdl_Tg)
+            else:
+                a_ppm = effective_alpha(mat, T_props_c)
+
+        E_pa = gpa_to_pa(E_gpa)
+
+        alpha_per_k = ppm_to_per_k(a_ppm)
+        props.append((mat, h_m, E_pa, alpha_per_k, z_bottom + h_m / 2.0, ls.material_key))
         z_bottom += h_m
 
-    total_h = z_bottom
-    na_layers = [(p[0], p[1], p[2] / 1e9) for p in props]
-    z_na = find_neutral_axis(na_layers)
+    total_h_m = z_bottom
+    alpha_sub_ppm_eff = reference_alpha_sub_ppm(props, packaging_architecture, default_ppm=alpha_sub_ppm)
+    alpha_sub = ppm_to_per_k(alpha_sub_ppm_eff)
+    na_layers = [(p[0], p[1], p[2], p[5]) for p in props]
+    z_na_m = find_neutral_axis_for_architecture(na_layers, packaging_architecture)
 
-    # Reference substrate moduli for denominator (use silicon substrate layer)
-    sub = next((p for p in props if p[0].layer_type.value == "silicon"), props[0])
-    E_ref = sub[2]
+    arch = parse_architecture(packaging_architecture)
+    if arch == PackagingArchitecture.FOWLP_INFO:
+        ref_candidates = [
+            p for p in props if p[0].layer_type in (LayerType.EMC, LayerType.CARRIER)
+        ]
+        sub = ref_candidates[0] if ref_candidates else props[0]
+    else:
+        sub = next((p for p in props if p[0].layer_type == LayerType.INTERPOSER), props[0])
+    if sub[0].layer_type == LayerType.SOLDER:
+        sub = next((p for p in props if p[0].layer_type != LayerType.SOLDER), sub)
+    E_ref = max(sub[2], E_REF_PA_FLOOR)
     nu_ref = sub[0].nu
 
     has_interposer = any(p[0].layer_type == LayerType.INTERPOSER for p in props)
     moment_sum = 0.0
     layer_states: list[LayerState] = []
 
-    for i, (mat, h_m, E_pa, alpha, z_c) in enumerate(props):
-        z_i = z_c - z_na
-        sigma = layer_thermal_stress_pa(E_pa, mat.nu, alpha, alpha_sub, delta_T)
+    for i, (mat, h_m, E_pa, alpha_per_k, z_c, _mkey) in enumerate(props):
+        z_i = z_c - z_na_m
+        sigma_pa = layer_thermal_stress_pa(E_pa, mat.nu, alpha_per_k, alpha_sub, delta_T)
 
         # Carrier constraint: glass carries share of moment until debond
         if carrier_constrained and mat.layer_type.value == "carrier":
-            sigma *= 0.35  # partial load transfer to carrier
+            sigma_pa *= 0.35  # partial load transfer to carrier
         elif not carrier_constrained and mat.layer_type.value == "carrier":
             continue
 
-        moment_term = 6.0 * sigma * h_m * z_i
-        # Rigid Si interposer resists bending more than compliant EMC
+        # Bending moment per unit width [N] (σ in Pa, h and z in m)
+        moment_term = sigma_pa * h_m * z_i
         if mat.layer_type == LayerType.INTERPOSER:
             moment_term *= INTERPOSER_MOMENT_GAIN
         elif mat.layer_type == LayerType.EMC and has_interposer:
             moment_term *= EMC_MOMENT_FACTOR_WITH_INTERPOSER
+        elif mat.layer_type == LayerType.SOLDER:
+            moment_term *= SOLDER_MOMENT_FACTOR
         moment_sum += moment_term
 
-        a_ppm_out = alpha * 1e6
+        a_ppm_out = alpha_per_k * 1e6
         layer_states.append(
             LayerState(
                 index=i,
@@ -277,40 +455,31 @@ def calculate_warpage(
                 thickness_m=h_m,
                 z_centroid_m=z_c,
                 z_from_na_m=z_i,
-                sigma_pa=sigma,
+                sigma_pa=sigma_pa,
                 alpha_eff_ppm=a_ppm_out,
                 E_eff_pa=E_pa,
             )
         )
 
-    # Debonding: redistribute released carrier moment to remaining layers
-    if not carrier_constrained:
-        carrier_present = any(
-            ls.material.layer_type.value == "carrier" for ls in active
-        )
-        if not carrier_present:
-            moment_sum *= 1.42  # elastic spring-back after carrier debond
-
     moment_sum *= moment_multiplier
 
-    h2 = max(total_h**2, 1e-18)
-    kappa = (1.0 - nu_ref) / (E_ref * h2) * moment_sum
+    h_m_stack = max(total_h_m, 1e-9)
+    D_eff = flexural_rigidity_pa_m3(E_ref, h_m_stack, nu_ref)
+    kappa_1_per_m = moment_sum / max(D_eff, 1e-30)
 
-    r_m = wafer_radius_mm * 1e-3
-    # Signed center-referenced edge height (mm); κ<0 → negative edge lift (Crown in center-ref)
-    w_edge_mm = 0.5 * kappa * r_m**2 * 1e3
+    w_edge_mm = warpage_at_radius_mm(kappa_1_per_m, wafer_radius_mm)
     w_center_mm = 0.0
 
     stress_map, r_grid, theta_grid = _build_stress_map(
-        kappa, layer_states, wafer_radius_mm
+        kappa_1_per_m, layer_states, wafer_radius_mm
     )
 
     return WarpageResult(
-        kappa_1_per_m=kappa,
+        kappa_1_per_m=kappa_1_per_m,
         warpage_center_mm=w_center_mm,
         warpage_edge_mm=w_edge_mm,
-        neutral_axis_m=z_na,
-        total_thickness_m=total_h,
+        neutral_axis_m=z_na_m,
+        total_thickness_m=total_h_m,
         layers=layer_states,
         carrier_constrained=carrier_constrained,
         stress_map_mpa=stress_map,
@@ -334,7 +503,8 @@ def _build_stress_map(
     # Radial variation from plate bending: sigma ~ E * z * kappa * r
     z_top = max((ls.z_from_na_m for ls in layers), default=0.0)
     E_avg = np.mean([ls.E_eff_pa for ls in layers]) if layers else 1e9
-    bend_factor = E_avg * z_top * kappa * 1e3  # scale to MPa-like magnitude
+    # σ_bend ≈ E·z·κ [Pa] → MPa
+    bend_factor = E_avg * z_top * kappa / 1e6
 
     stress = base_stress + bend_factor * (R / max(wafer_radius_mm, 1e-6)) ** 2
     # Azimuthal asymmetry from die shadow (simplified)
@@ -364,9 +534,8 @@ def _result_from_characteristic(
     w_edge_mm: float,
     wafer_radius_mm: float,
 ) -> WarpageResult:
-    """Rebuild κ from signed edge warpage (center-referenced)."""
-    r_m = wafer_radius_mm * 1e-3
-    kappa = 2.0 * (w_edge_mm * 1e-3) / max(r_m**2, 1e-18)
+    """Rebuild κ [1/m] from signed edge warpage w [mm] (center-referenced)."""
+    kappa = kappa_from_edge_warpage_mm(w_edge_mm, wafer_radius_mm)
     stress_map, r_grid, theta_grid = _build_stress_map(
         kappa, template.layers, wafer_radius_mm
     )
@@ -396,29 +565,50 @@ def simulate_process_sequence(
     **kwargs,
 ) -> list[ProcessStepSnapshot]:
     """
-    Paper-style sequential FOWLP warpage:
+    Paper-style sequential 2.5D packaging warpage:
     - Evolving stress-free temperature (residual stress after cool/hold).
     - Moment memory across steps (not reset when T_step == T_ref).
     - Debonding: carrier constraint release → warpage jump.
+    - Dynamic thermal history: ΔT = 0 until mold cure; then ΔT = Process T − stress-free T.
     """
-    profile = T_profile or PROCESS_TEMPERATURES
     T_sf = T_ref_initial
     moment_memory = 0.0
     last_constrained_w: float = 0.0
+    is_cured = False
     snapshots: list[ProcessStepSnapshot] = []
 
     substrate_thickness_um = kwargs.pop("substrate_thickness_um", None)
     layer_thickness_um = kwargs.pop("layer_thickness_um", None)
     layer_E_gpa = kwargs.pop("layer_E_gpa", None)
+    kwargs.pop("layer_active", None)  # timeline uses per-step presets only
+    kwargs.pop("measurement_T_c", None)
+    kwargs.pop("evaluation_T_c", None)
+    die_area_fraction = kwargs.pop("die_area_fraction", 0.30)
+    stress_free_T_c = kwargs.pop("stress_free_T_c", T_ref_initial)
+    packaging_architecture = kwargs.pop(
+        "packaging_architecture",
+        PackagingArchitecture.FOWLP_INFO.value,
+    )
     kwargs.pop("warpage_reference", None)  # legacy; center-referenced only
+    timeline = timeline_steps_for_architecture(packaging_architecture)
 
-    for step_idx, step in enumerate(ProcessStep):
+    for step_idx, tstep in enumerate(timeline):
+        layer_active = timeline_layer_active(tstep, packaging_architecture)
         layers, constrained = build_stack_for_step(
-            step,
+            tstep.internal_step,
+            packaging_architecture=packaging_architecture,
             substrate_thickness_um=substrate_thickness_um,
             layer_thickness_um=layer_thickness_um,
+            layer_active=layer_active,
         )
-        T_proc = profile.get(step, 25.0)
+        if tstep.carrier_constrained is not None:
+            constrained = tstep.carrier_constrained
+
+        T_proc = process_temperature_for_step(tstep, stress_free_T_c, T_profile)
+        if tstep.label in CURING_STATION_LABELS:
+            is_cured = True
+        delta_T_step = thermal_delta_for_timeline_step(is_cured, T_proc, stress_free_T_c)
+
         moment_mult = (1.0 + RESIDUAL_MOMENT_GAIN * moment_memory) * (
             1.0 + STEP_BUILDUP_GAIN * step_idx
         )
@@ -427,41 +617,78 @@ def simulate_process_sequence(
             layers,
             T_c=T_proc,
             T_ref_c=T_sf,
+            stress_free_T_c=stress_free_T_c,
+            delta_t_mode="process",
+            thermal_delta_T_c=delta_T_step,
+            die_area_fraction=die_area_fraction,
             wafer_radius_mm=wafer_radius_mm,
             carrier_constrained=constrained,
             moment_multiplier=moment_mult,
             layer_E_gpa=layer_E_gpa,
+            packaging_architecture=packaging_architecture,
             **kwargs,
         )
-        res = _scale_result(raw, WARPAGE_CALIBRATION)
-        w_char = characteristic_warpage_mm(res.kappa_1_per_m, wafer_radius_mm)
+        res = raw
+        if WARPAGE_CALIBRATION != 1.0:
+            res = _scale_result(raw, WARPAGE_CALIBRATION)
 
-        if step == ProcessStep.DEBONDING:
+        w_char = res.warpage_edge_mm
+
+        if tstep.release_carrier:
+            mold_label = "EMC Molding" if "CoWoS" in packaging_architecture else "Molding"
+            mold_tstep = timeline_step_by_label(packaging_architecture, mold_label)
+            if mold_tstep is not None:
+                la_mold = timeline_layer_active(mold_tstep, packaging_architecture)
+                layers_cool, _ = build_stack_for_step(
+                    mold_tstep.internal_step,
+                    packaging_architecture=packaging_architecture,
+                    substrate_thickness_um=substrate_thickness_um,
+                    layer_thickness_um=layer_thickness_um,
+                    layer_active=la_mold,
+                )
+                cool = calculate_warpage(
+                    layers_cool,
+                    T_c=T_proc,
+                    T_ref_c=T_sf,
+                    stress_free_T_c=stress_free_T_c,
+                    delta_t_mode="process",
+                    thermal_delta_T_c=delta_T_step,
+                    die_area_fraction=die_area_fraction,
+                    wafer_radius_mm=wafer_radius_mm,
+                    carrier_constrained=False,
+                    moment_multiplier=moment_mult,
+                    layer_E_gpa=layer_E_gpa,
+                    packaging_architecture=packaging_architecture,
+                    **kwargs,
+                )
+                if abs(cool.warpage_edge_mm) >= abs(w_char):
+                    res = cool
+                    w_char = cool.warpage_edge_mm
+
+        if tstep.release_carrier or tstep.internal_step == ProcessStep.DEBONDING:
             sign = 1.0 if last_constrained_w >= 0 else -1.0
             if last_constrained_w == 0.0:
                 sign = 1.0 if w_char >= 0 else -1.0
-            w_target = sign * max(
-                abs(w_char),
-                abs(last_constrained_w) * DEBOND_RELEASE_RATIO,
-            )
-            res = _result_from_characteristic(res, w_target, wafer_radius_mm)
-            w_char = w_target
+            w_mag = max(abs(w_char), abs(last_constrained_w) * DEBOND_RELEASE_RATIO)
+            w_target_mm = sign * w_mag
+            res = _result_from_characteristic(res, w_target_mm, wafer_radius_mm)
+            w_char = res.warpage_edge_mm
 
         w_edge = res.warpage_edge_mm
         w_center = 0.0
 
-        if constrained:
+        if constrained and abs(w_char) > 1e-9:
             last_constrained_w = w_char
 
-        dT = abs(T_proc - T_sf)
-        moment_memory = 0.88 * moment_memory + dT / 120.0
+        moment_memory = 0.88 * moment_memory + abs(delta_T_step) / 120.0
 
         snapshots.append(
             ProcessStepSnapshot(
-                step=step,
-                label=step.value,
+                step=tstep.internal_step,
+                label=tstep.label,
                 temperature_c=T_proc,
-                T_stress_free_c=T_sf,
+                T_stress_free_c=stress_free_T_c,
+                delta_T_c=delta_T_step,
                 result=res,
                 warpage_edge_mm=w_edge,
                 warpage_center_mm=w_center,
@@ -724,6 +951,8 @@ def plot_radial_warpage(
 def plot_process_timeline(
     snapshots: list[ProcessStepSnapshot],
     selected_idx: int,
+    *,
+    architecture_label: str = "",
 ) -> "go.Figure":
     """Signed process warpage curve; click a point to inspect."""
     import plotly.graph_objects as go
@@ -732,7 +961,13 @@ def plot_process_timeline(
     y = [float(s.warpage_edge_mm) for s in snapshots]
     labels = [str(s.label) for s in snapshots]
     hover_text = [
-        f"{s.label} ({s.shape_label})<br>T={float(s.temperature_c):.0f}°C<br>w={float(s.warpage_edge_mm):.3f} mm"
+        (
+            f"{s.label} ({s.shape_label})<br>"
+            f"Process T={float(s.temperature_c):.0f}°C<br>"
+            f"T_sf={float(s.T_stress_free_c):.0f}°C<br>"
+            f"ΔT={float(s.delta_T_c):.0f}°C<br>"
+            f"w={float(s.warpage_edge_mm):.4f} mm"
+        )
         for s in snapshots
     ]
     marker_colors = [
@@ -757,28 +992,47 @@ def plot_process_timeline(
     fig.add_hline(y=0, line_width=1, line_color="#424242", opacity=0.6)
 
     y_arr = np.asarray(y, dtype=float)
-    ymax_data = float(np.max(np.abs(y_arr))) if y_arr.size else 0.05
-    ymax = max(ymax_data * 1.15, WARPAGE_CRITICAL_MM * 1.08, 0.05)
+    ymax_data = float(np.max(np.abs(y_arr))) if y_arr.size else 0.0
+    # Scale Y axis to data so sub-mm process variation is visible (do not force ±1.5 mm view)
+    ymax = max(ymax_data * 1.25, 0.008, 1e-6)
     y_range = [-ymax, ymax]
 
-    fig.add_hline(
-        y=WARPAGE_CRITICAL_MM,
-        line_dash="dash",
-        line_color="#e53935",
-        line_width=2,
-        annotation_text=f"Fail +{WARPAGE_CRITICAL_MM} mm",
-        annotation_position="right",
-    )
-    fig.add_hline(
-        y=-WARPAGE_CRITICAL_MM,
-        line_dash="dash",
-        line_color="#e53935",
-        line_width=2,
-        annotation_text=f"Fail −{WARPAGE_CRITICAL_MM} mm",
-        annotation_position="right",
-    )
+    if WARPAGE_CRITICAL_MM <= ymax * 2.5:
+        fig.add_hline(
+            y=WARPAGE_CRITICAL_MM,
+            line_dash="dash",
+            line_color="#e53935",
+            line_width=2,
+            annotation_text=f"Fail +{WARPAGE_CRITICAL_MM} mm",
+            annotation_position="right",
+        )
+        fig.add_hline(
+            y=-WARPAGE_CRITICAL_MM,
+            line_dash="dash",
+            line_color="#e53935",
+            line_width=2,
+            annotation_text=f"Fail −{WARPAGE_CRITICAL_MM} mm",
+            annotation_position="right",
+        )
+        y_range[1] = max(y_range[1], WARPAGE_CRITICAL_MM * 1.05)
+        y_range[0] = -y_range[1]
+    else:
+        fig.add_annotation(
+            xref="paper",
+            yref="paper",
+            x=0.99,
+            y=0.98,
+            xanchor="right",
+            yanchor="top",
+            showarrow=False,
+            font=dict(color="#e53935", size=10),
+            text=f"Spec ±{WARPAGE_CRITICAL_MM:.1f} mm (off scale; peak |w| ≈ {ymax_data:.4f} mm)",
+        )
+    title = "Process warpage timeline (center-referenced, signed)"
+    if architecture_label:
+        title = f"{title}<br><sup>{architecture_label}</sup>"
     fig.update_layout(
-        title="FOWLP process warpage (center-referenced, signed)",
+        title=dict(text=title, x=0.02, xanchor="left"),
         xaxis=dict(tickmode="array", tickvals=x, ticktext=labels),
         yaxis_title="Warpage @ edge (mm)",
         yaxis=dict(range=y_range, autorange=False, zeroline=True),
@@ -806,7 +1060,7 @@ def stress_disk_map_mpa(
     base = sum(ls.sigma_pa for ls in layers) / max(len(layers), 1) / 1e6
     z_top = max((ls.z_from_na_m for ls in layers), default=0.0)
     E_avg = np.mean([ls.E_eff_pa for ls in layers]) if layers else 1e9
-    bend = E_avg * z_top * kappa * 1e3
+    bend = E_avg * z_top * kappa / 1e6
 
     stress = base + bend * (R / max(radius_mm, 1e-6)) ** 2
     stress += 0.15 * base * np.cos(4 * Theta) * (R / radius_mm)

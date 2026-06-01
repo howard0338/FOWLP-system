@@ -1,4 +1,4 @@
-"""Material properties and process definitions for FOWLP warpage simulation."""
+"""Material properties and process definitions for 2.5D packaging warpage simulation."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ class LayerType(str, Enum):
     DIE = "die"
     RDL = "rdl"
     CARRIER = "carrier"
+    SOLDER = "solder"
 
 
 @dataclass(frozen=True)
@@ -59,6 +60,14 @@ MATERIALS: dict[str, MaterialProps] = {
         alpha_ppm=2.6,
         layer_type=LayerType.DIE,
     ),
+    "Molding (EMC+Die)": MaterialProps(
+        name="Molding (EMC+Die)",
+        E_gpa=12.0,
+        nu=0.25,
+        alpha_ppm=12.0,
+        alpha2_ppm=40.0,
+        layer_type=LayerType.EMC,
+    ),
     "RDL (Polyimide)": MaterialProps(
         name="RDL (Polyimide)",
         E_gpa=3.5,
@@ -74,6 +83,13 @@ MATERIALS: dict[str, MaterialProps] = {
         nu=0.22,
         alpha_ppm=5.0,
         layer_type=LayerType.CARRIER,
+    ),
+    "Solder Bumps": MaterialProps(
+        name="Solder Bumps",
+        E_gpa=0.01,
+        nu=0.35,
+        alpha_ppm=22.0,
+        layer_type=LayerType.SOLDER,
     ),
 }
 
@@ -98,13 +114,27 @@ class LayerStack:
 
 
 class ProcessStep(str, Enum):
-    MOLDING_1ST = "1st Molding"
+    """Chip-last FO-WLP sequence: front RDL → molding → top RDL → back-end."""
+
     FS_RDL = "Front-Side RDL"
+    MOLDING = "Molding"
     TOP_RDL = "Top-RDL"
     CARRIER_ATTACH = "Carrier Attach"
     BACK_GRINDING = "Back Grinding"
     BS_RDL = "Back-Side RDL"
     DEBONDING = "Debonding"
+
+
+# Explicit thermal / mechanical sequence (do not rely on Enum definition order alone).
+PROCESS_ORDER: list[ProcessStep] = [
+    ProcessStep.FS_RDL,
+    ProcessStep.MOLDING,
+    ProcessStep.TOP_RDL,
+    ProcessStep.CARRIER_ATTACH,
+    ProcessStep.BACK_GRINDING,
+    ProcessStep.BS_RDL,
+    ProcessStep.DEBONDING,
+]
 
 
 @dataclass
@@ -125,11 +155,12 @@ DEFAULT_THICKNESS = {
     "Die/Chip": 100.0,
     "RDL (Polyimide)": 15.0,
     "Carrier Glass": 500.0,
+    "Solder Bumps": 80.0,
 }
 
 # Process temperature profile per step (°C)
 PROCESS_TEMPERATURES: dict[ProcessStep, float] = {
-    ProcessStep.MOLDING_1ST: 175.0,
+    ProcessStep.MOLDING: 175.0,
     ProcessStep.FS_RDL: 200.0,
     ProcessStep.TOP_RDL: 220.0,
     ProcessStep.CARRIER_ATTACH: 180.0,
@@ -139,6 +170,8 @@ PROCESS_TEMPERATURES: dict[ProcessStep, float] = {
 }
 
 PROCESS_T_REF_C = 25.0
+DEFAULT_MEASUREMENT_T_C = 25.0  # measurement / room-temperature warpage assessment (°C)
+DEFAULT_EVALUATION_T_C = DEFAULT_MEASUREMENT_T_C  # legacy alias
 DEFAULT_STRESS_FREE_T_C = 175.0  # molding cure / stress-free temperature (°C)
 WAFER_RADIUS_MM = 150.0  # 300 mm wafer
 WARPAGE_CRITICAL_MM = 1.5
@@ -234,9 +267,22 @@ INPUT_LAYER_SPECS: list[LayerInputSpec] = [
         alpha1_ppm_default=5.0,
         note="剛性載板",
     ),
+    LayerInputSpec(
+        material_key="Solder Bumps",
+        display_name="Solder Bumps (植球層)",
+        thickness_um_default=80.0,
+        thickness_um_range=(20.0, 150.0),
+        E_gpa_default=0.01,
+        E_gpa_range=(0.001, 1.0),
+        cte_display="22.0",
+        alpha1_ppm_default=22.0,
+        note="Wafer/C4 bumping · discrete solder",
+    ),
 ]
 
 PARAM_RANGES = {
+    "measurement_T": (-40.0, 125.0, 25.0),
+    "die_area_fraction": (0.05, 0.70, 0.30),
     "stress_free_T": (150.0, 200.0, 175.0),
     "emc_alpha1": (8.0, 15.0, 12.0),
     "emc_alpha2": (30.0, 60.0, 40.0),
@@ -250,10 +296,17 @@ PARAM_RANGES = {
 STRESS_FREE_RELAXATION = 0.28
 RESIDUAL_MOMENT_GAIN = 0.22
 STEP_BUILDUP_GAIN = 0.11  # cumulative packaging build per process index
-DEBOND_RELEASE_RATIO = 1.82  # warpage jump vs last carrier-constrained step
-WARPAGE_CALIBRATION = 920.0  # micromechanics → package-scale (mm) per literature trend
+# Mild warpage jump when carrier / substrate constraint is released (dimensionless ratio on |w|)
+DEBOND_RELEASE_RATIO = 1.35
+# Legacy hook kept at unity — warpage is computed in SI; do not apply empirical mm scaling here
+WARPAGE_CALIBRATION = 1.0
 
-# FOWLP stack: rigid Si interposer vs compliant EMC (moment weighting in plate model)
+# Solder bump: near-zero flexural rigidity (discrete spheres — excluded from bending moment)
+SOLDER_MOMENT_FACTOR = 0.0
+E_MIN_SOLDER_GPA = 1e-6
+E_REF_PA_FLOOR = 1e6
+
+# 2.5D stack: rigid Si interposer vs compliant EMC (moment weighting in plate model)
 INTERPOSER_MOMENT_GAIN = 1.38
 EMC_MOMENT_FACTOR_WITH_INTERPOSER = 0.40
 
@@ -273,49 +326,18 @@ def _t(
 def build_stack_for_step(
     step: ProcessStep,
     *,
+    packaging_architecture: str | None = None,
     substrate_thickness_um: float | None = None,
     layer_thickness_um: dict[str, float] | None = None,
+    layer_active: dict[str, bool] | None = None,
 ) -> tuple[list[LayerStack], bool]:
-    """Return active layer stack and whether carrier provides mechanical constraint."""
-    lt = layer_thickness_um or {}
-    t_sub = substrate_thickness_um if substrate_thickness_um is not None else _t(lt, "Silicon Substrate")
-    base = [
-        LayerStack("Silicon Substrate", t_sub),
-        LayerStack("Silicon Interposer", _t(lt, "Silicon Interposer")),
-        LayerStack("EMC (Molding)", _t(lt, "EMC (Molding)")),
-        LayerStack("Die/Chip", _t(lt, "Die/Chip")),
-    ]
+    """Delegate to packaging_arch (FOWLP InFO vs 2.5D CoWoS-S layer build-up)."""
+    from packaging_arch import build_stack_for_step as _build
 
-    rdl_t = _t(lt, "RDL (Polyimide)")
-    rdl = LayerStack("RDL (Polyimide)", rdl_t)
-    carrier = LayerStack("Carrier Glass", _t(lt, "Carrier Glass"))
-
-    if step == ProcessStep.MOLDING_1ST:
-        return base, False
-
-    if step == ProcessStep.FS_RDL:
-        return base + [rdl], False
-
-    if step == ProcessStep.TOP_RDL:
-        return base + [rdl, LayerStack("RDL (Polyimide)", 10.0)], False
-
-    if step == ProcessStep.CARRIER_ATTACH:
-        return base + [rdl, carrier], True
-
-    if step == ProcessStep.BACK_GRINDING:
-        thin_sub = LayerStack("Silicon Substrate", 100.0)
-        return [thin_sub] + base[1:] + [rdl, carrier], True
-
-    if step == ProcessStep.BS_RDL:
-        thin_sub = LayerStack("Silicon Substrate", 100.0)
-        bs_rdl = LayerStack("RDL (Polyimide)", 12.0)
-        return [thin_sub] + base[1:] + [rdl, bs_rdl, carrier], True
-
-    # Debonding: carrier removed, stress relaxation
-    thin_sub = LayerStack("Silicon Substrate", 100.0)
-    bs_rdl = LayerStack("RDL (Polyimide)", 12.0)
-    debond_stack = [thin_sub] + base[1:] + [rdl, bs_rdl]
-    return debond_stack, False
-
-
-PROCESS_ORDER: list[ProcessStep] = list(ProcessStep)
+    return _build(
+        step,
+        packaging_architecture=packaging_architecture or "FOWLP (InFO)",
+        substrate_thickness_um=substrate_thickness_um,
+        layer_thickness_um=layer_thickness_um,
+        layer_active=layer_active,
+    )
