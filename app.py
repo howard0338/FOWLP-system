@@ -442,8 +442,8 @@ def render_simulator_tab(mat_in: MaterialInputConfig) -> None:
 
     if snap.label == "Carrier Release":
         st.info("**Carrier Release**：載板約束釋放 · 翹曲跳升（signed）")
-    elif snap.label == "WoS (Substrate)":
-        st.info("**WoS (Substrate)**：結合載板 · 整疊層參與計算")
+    elif snap.label == "Substrate Integration":
+        st.info("**Substrate Integration**：結合基板 · 整疊層參與計算")
 
 
 

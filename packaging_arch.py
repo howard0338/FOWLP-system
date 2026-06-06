@@ -10,18 +10,25 @@ from constants import DEFAULT_THICKNESS, LayerStack, ProcessStep
 
 
 class PackagingArchitecture(str, Enum):
-    FOWLP_INFO = "FOWLP (InFO)"
-    COWOS_S = "2.5D CoWoS-S"
+    FOWLP_INFO = "FOWLP (Fan-Out Wafer Level Packaging)"
+    COWOS_S = "2.5D Silicon Interposer"
+
+
+# Legacy UI strings → enum (session state / saved configs)
+_ARCHITECTURE_UI_ALIASES: dict[str, PackagingArchitecture] = {
+    "FOWLP (InFO)": PackagingArchitecture.FOWLP_INFO,
+    "2.5D CoWoS-S": PackagingArchitecture.COWOS_S,
+}
 
 
 # Blue info-box copy (main panel)
 ARCHITECTURE_PROCESS_DESCRIPTION: dict[PackagingArchitecture, str] = {
     PackagingArchitecture.FOWLP_INFO: (
-        "FOWLP (InFO) 標準製程 (Chip-First)：Carrier 放片 → Molding (灌注 EMC) → "
+        "FOWLP (Fan-Out Wafer Level Packaging) · Chip-First：Carrier 放片 → Molding (灌注 EMC) → "
         "移除 Carrier 翻面 → 長 Front-Side RDL。"
     ),
     PackagingArchitecture.COWOS_S: (
-        "2.5D CoWoS-S 標準製程：Silicon Interposer 穿孔與前段 RDL → CoW 貼合 (放 Die) → "
+        "2.5D Silicon Interposer：Interposer 穿孔與前段 RDL → Die 貼合 → "
         "Molding (灌注 EMC) → 背磨薄化 → 結合 Substrate。"
     ),
 }
@@ -38,11 +45,11 @@ STEPS_FOWLP: list[str] = [
 
 STEPS_COWOS: list[str] = [
     "Interposer RDL",
-    "CoW Attach",
+    "Die on Interposer",
     "EMC Molding",
     "Back Grinding",
     "C4 Bumping",
-    "WoS (Substrate)",
+    "Substrate Integration",
 ]
 
 SOLDER_BUMPS_KEY = "Solder Bumps"
@@ -85,7 +92,7 @@ COWOS_STATION_LAYER_ACTIVE: dict[str, dict[str, bool]] = {
         "EMC (Molding)": False,
         SOLDER_BUMPS_KEY: False,
     },
-    "CoW Attach": {
+    "Die on Interposer": {
         "Silicon Substrate": False,
         "Silicon Interposer": True,
         "RDL (Polyimide)": True,
@@ -117,7 +124,7 @@ COWOS_STATION_LAYER_ACTIVE: dict[str, dict[str, bool]] = {
         "EMC (Molding)": True,
         SOLDER_BUMPS_KEY: True,
     },
-    "WoS (Substrate)": {
+    "Substrate Integration": {
         "Silicon Substrate": True,
         "Silicon Interposer": True,
         "RDL (Polyimide)": True,
@@ -220,11 +227,11 @@ def _timeline_fowlp() -> list[TimelineStepConfig]:
 def _timeline_cowos() -> list[TimelineStepConfig]:
     specs: list[tuple[str, ProcessStep, float, bool | None]] = [
         ("Interposer RDL", ProcessStep.FS_RDL, 25.0, False),
-        ("CoW Attach", ProcessStep.TOP_RDL, 25.0, False),
+        ("Die on Interposer", ProcessStep.TOP_RDL, 25.0, False),
         ("EMC Molding", ProcessStep.MOLDING, 175.0, False),
         ("Back Grinding", ProcessStep.BACK_GRINDING, 25.0, False),
         ("C4 Bumping", ProcessStep.BS_RDL, 260.0, False),
-        ("WoS (Substrate)", ProcessStep.CARRIER_ATTACH, 25.0, True),
+        ("Substrate Integration", ProcessStep.CARRIER_ATTACH, 25.0, True),
     ]
     return [
         TimelineStepConfig(
@@ -288,6 +295,8 @@ FOWLP_COMPLIANT_LAYER_TYPES = frozenset({"emc", "rdl", "carrier"})
 
 
 def parse_architecture(value: str) -> PackagingArchitecture:
+    if value in _ARCHITECTURE_UI_ALIASES:
+        return _ARCHITECTURE_UI_ALIASES[value]
     for arch in PackagingArchitecture:
         if arch.value == value:
             return arch

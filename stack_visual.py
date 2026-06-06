@@ -131,15 +131,13 @@ def _bands_bottom_to_top(
     return bands
 
 
-def _visual_bands_top_first(
+def _active_legend_bands_top_first(
     cfg: MaterialInputConfig,
     step: ProcessStep,
-    *,
-    layer_active: dict[str, bool] | None = None,
+    active_map: dict[str, bool],
 ) -> list[dict[str, Any]]:
-    """Display order: top (RDL / EMC side) → bottom (Carrier / Substrate)."""
-    _ = step
-    return list(reversed(_bands_bottom_to_top(cfg, layer_active=layer_active)))
+    """Legend rows = solver plate only (no grey future/inactive layers)."""
+    return list(reversed(_solver_plate_segments_bottom_to_top(cfg, step, active_map)))
 
 
 def _band_is_active(band: dict[str, Any]) -> bool:
@@ -285,7 +283,7 @@ def _html_legend_row(band: dict[str, Any]) -> str:
         active = band["active"]
         band_cls = "fowlp-legend fowlp-legend--on" if active else "fowlp-legend fowlp-legend--off"
         meta = f"t = {band['t_um']:.0f} µm · E = {band['e_gpa']:.1f} GPa"
-        extra = "" if active else '<div class="fowlp-status">not in this step</div>'
+        extra = ""
     return f"""
 <div class="{band_cls}">
   <div class="fowlp-legend-title">{html.escape(band['title'])}</div>
@@ -624,13 +622,13 @@ def build_stack_schematic_html(
     temperature_c: float | None = None,
 ) -> str:
     active_map = dict(layer_active if layer_active is not None else cfg.layer_active)
-    bands = _visual_bands_top_first(cfg, step, layer_active=active_map)
-    if not bands:
+    plate_segments = _solver_plate_segments_bottom_to_top(cfg, step, active_map)
+    if not plate_segments:
         return "<p style='color:#64748B;font-family:system-ui'>No layer data</p>"
 
-    plate_segments = _solver_plate_segments_bottom_to_top(cfg, step, active_map)
     seg_heights = _segment_heights_px(plate_segments)
     total_t = sum(s["t_um"] for s in plate_segments) or _plate_thickness_um(cfg, step, active_map)
+    legend_bands = _active_legend_bands_top_first(cfg, step, active_map)
 
     plate_parts: list[str] = []
     for band, seg_px in zip(plate_segments, seg_heights):
@@ -639,7 +637,7 @@ def build_stack_schematic_html(
         else:
             plate_parts.append(_html_plate_segment_layer(band, seg_px))
 
-    legend_parts = [_html_legend_row(b) for b in bands]
+    legend_parts = [_html_legend_row(b) for b in legend_bands]
 
     z_marker = ""
     if z_na_um is not None and total_t > 0 and plate_segments:
@@ -664,15 +662,7 @@ def build_stack_schematic_html(
         if z_na_um is not None
         else ""
     )
-    active_n = sum(
-        1
-        for b in bands
-        if (
-            b["kind"] == "composite"
-            and (b.get("die_active") or b.get("emc_active"))
-        )
-        or (b.get("kind") == "layer" and b.get("active"))
-    )
+    active_n = len(plate_segments)
 
     css = _stack_visual_css()
     return f"""
@@ -713,8 +703,9 @@ def schematic_height_px(
     *,
     layer_active: dict[str, bool] | None = None,
 ) -> int:
-    bands = _visual_bands_top_first(cfg, step, layer_active=layer_active)
-    legend_rows = max(len(bands), 1)
+    active_map = dict(layer_active if layer_active is not None else cfg.layer_active)
+    plate_segments = _solver_plate_segments_bottom_to_top(cfg, step, active_map)
+    legend_rows = max(len(plate_segments), 1)
     body_h = max(_STACK_BAR_PX, legend_rows * 52)
     return int(118 + body_h + 40)
 
@@ -725,7 +716,8 @@ def _layer_rows(
     *,
     layer_active: dict[str, bool] | None = None,
 ) -> list[dict[str, Any]]:
-    return _visual_bands_top_first(cfg, step, layer_active=layer_active)
+    active_map = dict(layer_active if layer_active is not None else cfg.layer_active)
+    return _active_legend_bands_top_first(cfg, step, active_map)
 
 
 def render_stack_schematic(

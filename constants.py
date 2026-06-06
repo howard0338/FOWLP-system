@@ -173,7 +173,7 @@ PROCESS_T_REF_C = 25.0
 DEFAULT_MEASUREMENT_T_C = 25.0  # measurement / room-temperature warpage assessment (°C)
 DEFAULT_EVALUATION_T_C = DEFAULT_MEASUREMENT_T_C  # legacy alias
 DEFAULT_STRESS_FREE_T_C = 175.0  # molding cure / stress-free temperature (°C)
-WAFER_RADIUS_MM = 150.0  # 300 mm wafer (solver internal, mm)
+WAFER_RADIUS_MM = 50.0  # wafer radius default (mm)
 WARPAGE_CRITICAL_MM = 1.5  # solver / compare threshold (mm)
 
 # UI length & warpage display (micrometers)
@@ -351,7 +351,7 @@ def build_stack_for_step(
 
     return _build(
         step,
-        packaging_architecture=packaging_architecture or "FOWLP (InFO)",
+        packaging_architecture=packaging_architecture or "FOWLP (Fan-Out Wafer Level Packaging)",
         substrate_thickness_um=substrate_thickness_um,
         layer_thickness_um=layer_thickness_um,
         layer_active=layer_active,

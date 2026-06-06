@@ -34,7 +34,7 @@ class MaterialInputConfig:
     T_ref: float = DEFAULT_STRESS_FREE_T_C
     measurement_T_c: float = DEFAULT_MEASUREMENT_T_C
     die_area_fraction: float = DEFAULT_DIE_AREA_FRACTION
-    wafer_radius_mm: float = 150.0
+    wafer_radius_mm: float = 50.0
     packaging_architecture: str = PackagingArchitecture.FOWLP_INFO.value
     process_station: str = ""
     layer_active: dict[str, bool] = field(default_factory=dict)

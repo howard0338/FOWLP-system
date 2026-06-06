@@ -638,7 +638,11 @@ def simulate_process_sequence(
         w_char = res.warpage_edge_mm
 
         if tstep.release_carrier:
-            mold_label = "EMC Molding" if "CoWoS" in packaging_architecture else "Molding"
+            mold_label = (
+                "EMC Molding"
+                if parse_architecture(packaging_architecture) == PackagingArchitecture.COWOS_S
+                else "Molding"
+            )
             mold_tstep = timeline_step_by_label(packaging_architecture, mold_label)
             if mold_tstep is not None:
                 la_mold = timeline_layer_active(mold_tstep, packaging_architecture)
@@ -724,6 +728,15 @@ def warpage_profile_radial(
     r_mm = np.linspace(0, r_max, n_points)
     w_mm = np.array([displacement_mm(result.kappa_1_per_m, r) for r in r_mm])
     return r_mm, w_mm
+
+
+def _warpage_3d_z_aspect(z_span_um: float, radius_mm: float) -> float:
+    """Plotly scene z aspect: physical warpage height vs wafer diameter, visually compressed."""
+    z_mm = max(float(z_span_um), 1e-6) / UM_PER_MM
+    xy_mm = 2.0 * max(float(radius_mm), 1.0)
+    physical = z_mm / xy_mm
+    # Mild boost for visibility; cap keeps bowl/crown from looking cartoonish
+    return float(max(0.012, min(0.10, physical * 2.5)))
 
 
 def warpage_display_unit(peak_mm: float) -> tuple[float, str]:
@@ -813,6 +826,7 @@ def plot_wafer_surface(
         ]
     )
     z_span = zmax - zmin
+    z_aspect = _warpage_3d_z_aspect(z_span, radius_mm)
     fig.update_layout(
         title=title,
         scene=dict(
@@ -821,7 +835,7 @@ def plot_wafer_surface(
             zaxis_title=f"Warpage w ({unit})",
             zaxis=dict(autorange=False, range=[zmin, zmax]),
             aspectmode="manual",
-            aspectratio=dict(x=1, y=1, z=min(0.8, max(0.15, z_span / max(radius_mm, 1.0)))),
+            aspectratio=dict(x=1, y=1, z=z_aspect),
             camera=dict(eye=dict(x=1.6, y=1.6, z=0.9)),
         ),
         height=520,
